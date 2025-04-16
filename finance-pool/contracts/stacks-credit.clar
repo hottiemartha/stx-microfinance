@@ -17,6 +17,8 @@
 (define-constant ERR-NO-LOAN-ACTIVE (err u122))
 (define-constant ERR-EXTENSION-LIMIT-REACHED (err u123))
 (define-constant ERR-EARLY-REPAYMENT-PROCESSING (err u124))
+(define-constant ERR-INVALID-STATUS (err u125))
+(define-constant ERR-INVALID-ADDRESS (err u126))
 
 ;; CONTRACT CONFIGURATION CONSTANTS
 (define-constant contract-administrator tx-sender)
@@ -66,6 +68,9 @@
     }
 )
 
+;; Valid loan statuses
+(define-data-var valid-statuses (list 5 (string-ascii 20)) (list "ACTIVE" "COMPLETED" "DEFAULT" "OVERDUE" "CLOSED"))
+
 ;; ARITHMETIC SAFETY FUNCTIONS
 (define-private (add-with-overflow-check (first-value uint) (second-value uint))
     (let ((result-sum (+ first-value second-value)))
@@ -105,6 +110,28 @@
     (and 
         (> rate u0)
         (<= rate u1000000) ;; Max 100% APR represented as 1000000/1000000
+    )
+)
+
+;; Validate if a given status is in the list of valid statuses
+(define-private (validate-loan-status (status (string-ascii 20)))
+    (is-some (index-of (var-get valid-statuses) status))
+)
+
+;; Validate borrower address
+(define-private (validate-borrower-address (address principal))
+    (and 
+        (not (is-eq address (as-contract tx-sender)))  ;; Address should not be the contract itself
+        (not (is-eq address contract-administrator))   ;; Address should not be the administrator
+        (is-some (map-get? active-loans { borrower-address: address })) ;; Address should have an active loan
+    )
+)
+
+;; Enhanced address validation for admin functions
+(define-private (validate-address-for-admin (address principal))
+    (and 
+        (not (is-eq address (as-contract tx-sender)))  ;; Address should not be the contract itself
+        (not (is-eq address contract-administrator))   ;; Address should not be the administrator
     )
 )
 
@@ -201,10 +228,14 @@
 
         (let (
             (updated-repaid-amount (try! (add-with-overflow-check (get amount-repaid loan-details) payment-amount)))
-            (interest-calculated (try! (calculate-interest-amount 
-                                        (get borrowed-amount loan-details) 
-                                        (get annual-interest-rate loan-details))))
-            (total-obligation (try! (add-with-overflow-check (get borrowed-amount loan-details) interest-calculated)))
+            (elapsed-blocks (- current-block-height (get loan-creation-height loan-details)))
+            (total-blocks (- (get loan-maturity-height loan-details) (get loan-creation-height loan-details)))
+            (prorated-interest (try! (calculate-prorated-interest 
+                                    (get borrowed-amount loan-details) 
+                                    (get annual-interest-rate loan-details)
+                                    elapsed-blocks
+                                    total-blocks)))
+            (total-obligation (try! (add-with-overflow-check (get borrowed-amount loan-details) prorated-interest)))
         )
             (try! (stx-transfer? payment-amount borrower-address (as-contract tx-sender)))
 
@@ -240,6 +271,21 @@
     )
 )
 
+(define-read-only (calculate-prorated-interest (principal uint) (rate uint) (elapsed-blocks uint) (total-blocks uint))
+    (begin
+        (asserts! (validate-interest-rate rate) ERR-INTEREST-RATE-INVALID)
+        (asserts! (> total-blocks u0) ERR-TERM-INVALID)
+        (asserts! (<= elapsed-blocks total-blocks) ERR-LOAN-PAST-DUE)
+        
+        (let (
+            (full-interest (try! (calculate-interest-amount principal rate)))
+            (prorated (/ (* full-interest elapsed-blocks) total-blocks))
+        )
+            (ok prorated)
+        )
+    )
+)
+
 (define-read-only (get-borrower-loan-details (borrower-address principal))
     (map-get? active-loans { borrower-address: borrower-address })
 )
@@ -253,12 +299,20 @@
 )
 
 ;; ADMINISTRATIVE FUNCTIONS
+;; Fixed function with proper validation of borrower-address
 (define-public (change-loan-status (borrower-address principal) (updated-status (string-ascii 20)))
     (begin
         (asserts! (is-eq tx-sender contract-administrator) ERR-UNAUTHORIZED-ACCESS)
         (asserts! (check-contract-status) ERR-UNAUTHORIZED-ACCESS)
-        (match (map-get? active-loans { borrower-address: borrower-address })
-            loan-details (begin
+        (asserts! (validate-loan-status updated-status) ERR-INVALID-STATUS)
+        (asserts! (validate-address-for-admin borrower-address) ERR-INVALID-ADDRESS)
+        
+        ;; Check if loan exists before proceeding
+        (let ((loan-exists (is-some (map-get? active-loans { borrower-address: borrower-address }))))
+            (asserts! loan-exists ERR-LOAN-NOT-REGISTERED)
+            
+            ;; Now safely access the loan data with validated address
+            (let ((loan-details (unwrap! (map-get? active-loans { borrower-address: borrower-address }) ERR-LOAN-NOT-REGISTERED)))
                 (map-set active-loans
                     { borrower-address: borrower-address }
                     (merge loan-details { 
@@ -268,7 +322,6 @@
                 )
                 (ok true)
             )
-            ERR-LOAN-NOT-REGISTERED
         )
     )
 )
@@ -377,9 +430,16 @@
         (asserts! (> payment-amount u0) ERR-AMOUNT-INVALID)
 
         (let (
+            (elapsed-blocks (- current-block-height (get loan-creation-height loan-details)))
+            (total-blocks (- (get loan-maturity-height loan-details) (get loan-creation-height loan-details)))
+            (accrued-interest (try! (calculate-prorated-interest 
+                              (get borrowed-amount loan-details) 
+                              (get annual-interest-rate loan-details)
+                              elapsed-blocks
+                              total-blocks)))
             (outstanding-principal (- (get borrowed-amount loan-details) (get amount-repaid loan-details)))
-            (early-payment-discount (/ (* outstanding-principal early-payment-discount-rate) u1000000))
-            (discounted-payoff-amount (- outstanding-principal early-payment-discount))
+            (early-payment-discount (/ (* (+ outstanding-principal accrued-interest) early-payment-discount-rate) u1000000))
+            (discounted-payoff-amount (- (+ outstanding-principal accrued-interest) early-payment-discount))
         )
             (asserts! (>= payment-amount discounted-payoff-amount) ERR-BALANCE-INSUFFICIENT)
 
@@ -397,9 +457,47 @@
             )
 
             ;; Update contract state
-            (var-set outstanding-loan-count (- (var-get outstanding-loan-count) u1))
-            (var-set lending-pool-balance (+ (var-get lending-pool-balance) payment-amount))
+            (var-set outstanding-loan-count (try! (subtract-with-overflow-check (var-get outstanding-loan-count) u1)))
+            (var-set lending-pool-balance (try! (add-with-overflow-check (var-get lending-pool-balance) payment-amount)))
 
+            (ok true)
+        )
+    )
+)
+
+;; LOAN EXTENSION FUNCTION
+(define-public (extend-loan-term (extension-blocks uint))
+    (let (
+        (borrower-address tx-sender)
+        (loan-details (unwrap! (map-get? active-loans {borrower-address: borrower-address}) ERR-LOAN-NOT-REGISTERED))
+        (current-block-height block-height)
+        (original-term (- (get loan-maturity-height loan-details) (get loan-creation-height loan-details)))
+        (allowed-extension (* original-term extension-limit-maximum u1 (/ u1 u10))) ;; Max extension is 30% of original term
+    )
+        (asserts! (is-eq (get loan-status loan-details) "ACTIVE") ERR-LOAN-NOT-IN-ACTIVE-STATE)
+        (asserts! (<= extension-blocks allowed-extension) ERR-EXTENSION-LIMIT-REACHED)
+        (asserts! (validate-loan-term (+ original-term extension-blocks)) ERR-TERM-INVALID)
+        
+        ;; Calculate extension fee
+        (let (
+            (loan-balance (- (get borrowed-amount loan-details) (get amount-repaid loan-details)))
+            (extension-fee (/ (* loan-balance extension-fee-percentage) u1000000))
+        )
+            ;; Process fee payment
+            (try! (stx-transfer? extension-fee borrower-address (as-contract tx-sender)))
+            
+            ;; Update loan terms
+            (map-set active-loans
+                {borrower-address: borrower-address}
+                (merge loan-details {
+                    loan-maturity-height: (+ (get loan-maturity-height loan-details) extension-blocks),
+                    recent-payment-height: current-block-height
+                })
+            )
+            
+            ;; Add fee to lending pool
+            (var-set lending-pool-balance (try! (add-with-overflow-check (var-get lending-pool-balance) extension-fee)))
+            
             (ok true)
         )
     )
